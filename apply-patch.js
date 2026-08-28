@@ -1,18 +1,15 @@
 #!/usr/bin/env node
 /**
- * dsh-crash-guard v2 — 自动给 DSH (DeepSeek Harness) 打崩溃防护补丁
+ * dsh-crash-guard v2.1 — 自动给 DSH (DeepSeek Harness) 打崩溃防护补丁
  *
- * 问题: DSH 后端遇到 socket ECONNRESET / worker 线程崩溃时,
- *      因缺少 error 处理器导致 "Unhandled 'error' event" -> 进程闪退;
- *      且旧版防护只把错误打到 console —— DSH 从桌面 .cmd 窗口启动时,
- *      窗口一关/不盯着, 报错就彻底丢失, 无法定位真正的崩溃原因。
- *
- * v2 改进:
- *   1. 所有防护 handler 同时写入 ~/.dsh/logs/crash-guard.log (带时间戳), console 仍保留;
- *   2. 每次 DSH 启动/worker 加载写一条 boot 日志, 便于确认防护是否生效;
- *   3. 旧版补丁自动原位升级 (无需先还原)。
- *
- * 配套: start-guard.cmd — 守护启动器, dsh web 崩溃后 3 秒自动重启。
+ * v2.1 修订(基于 2026-08-29 事故复盘):
+ *   1. 日志目录在打补丁时固化(LOGDIR 绝对路径), 不再依赖运行时环境变量
+ *      (worker 沙箱环境被剥离时 USERPROFILE/HOME 缺失, 旧版会写偏到 C:\.dsh);
+ *   2. worker index.js 是 ESM(type=module), 文件写入改用 import() 异步 IIFE,
+ *      旧版 require() 在 ESM 中未定义被 catch 吞掉 -> 文件日志静默失效;
+ *   3. 移除 app-boot 的 boot 日志(与 bin.js 重复, 同进程两条);
+ *   4. start-guard.cmd 增加 UAC 提权(与官方管理员终端一致);
+ *   5. 锚点命中必须唯一(worker 运行回调), 否则中止不写文件。
  *
  * 用法: node apply-patch.js [--dsh <path>] [--restore]
  */
@@ -21,8 +18,8 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 
-const TAG = "[dsh-crash-guard:v2]";
-const V2_MARKER = "dsh-crash-guard:v2";
+const TAG = "[dsh-crash-guard:v2.1]";
+const MARK = "dsh-crash-guard:v2.1";
 
 function log(...a) { console.log(TAG, ...a); }
 
@@ -45,69 +42,86 @@ function findDshRoot() {
   throw new Error("找不到 DSH 安装目录，请用 --dsh <path> 指定");
 }
 
-// ---------- v2 防护代码 ----------
+// 固化日志目录: 打补丁时解析(此时是正常 shell, 环境变量齐全)
+function resolveLogDir() {
+  const home = process.env.USERPROFILE || process.env.HOME || "";
+  if (home) return home.replace(/\\/g, "/") + "/.dsh/logs";
+  throw new Error("无法解析用户主目录(USERPROFILE/HOME), 请用环境变量指定");
+}
 
-const GUARD_ESM = [
-  '// ===== [dsh-crash-guard:v2] 崩溃防护（文件日志版）=====',
-  'const cgWrite = async (kind, payload) => {',
-  '  const line = "[dsh-crash-guard] " + new Date().toISOString() + " [" + kind + "] " + String(payload ?? "") + "\\n";',
-  '  try { console.error(line.trimEnd()); } catch (_) {}',
-  '  try {',
-  '    const m = await import("node:fs");',
-  '    const dir = (process.env.USERPROFILE || process.env.HOME || process.cwd() || "").replace(/\\\\/g, "/") + "/.dsh/logs";',
-  '    m.mkdirSync(dir, { recursive: true });',
-  '    m.appendFileSync(dir + "/crash-guard.log", line, "utf8");',
-  '  } catch (_) {}',
-  '};',
-  'process.on("uncaughtException", (err) => { cgWrite("uncaughtException", err?.stack || err); });',
-  'process.on("unhandledRejection", (reason) => { cgWrite("unhandledRejection", reason); });',
-  'process.on("error", (err) => { cgWrite("process-error", err?.stack || err); });',
-  'cgWrite("boot", "dsh 进程启动 pid=" + process.pid);',
-  '// ===== end crash-guard-v2 =====',
-].join("\n");
+// ---------- v2.1 防护代码 ----------
 
-const GUARD_CJS = [
-  '// ===== [dsh-crash-guard:v2] worker 崩溃防护（文件日志版）=====',
-  'const cgWrite = (kind, payload) => {',
-  '  const line = "[dsh-crash-guard] " + new Date().toISOString() + " [" + kind + "] " + String(payload ?? "") + "\\n";',
-  '  if (kind !== "boot") { try { console.error(line.trimEnd()); } catch (_) {} }',
-  '  try {',
-  '    const m = require("node:fs");',
-  '    const dir = (process.env.USERPROFILE || process.env.HOME || process.cwd() || "").replace(/\\\\/g, "/") + "/.dsh/logs";',
-  '    m.mkdirSync(dir, { recursive: true });',
-  '    m.appendFileSync(dir + "/crash-guard.log", line, "utf8");',
-  '  } catch (_) {}',
-  '};',
-  'process.on("uncaughtException", (err) => { cgWrite("worker-uncaughtException", err?.stack || err); });',
-  'process.on("unhandledRejection", (reason) => { cgWrite("worker-unhandledRejection", reason); });',
-  'cgWrite("boot", "worker 线程加载 pid=" + process.pid);',
-  '// ===== end crash-guard-v2 =====',
-].join("\n");
+function makeGuardEsm(logDir, withBoot) {
+  const lines = [
+    '// ===== [' + MARK + '] 崩溃防护（文件日志版）=====',
+    'const CG_LOG_DIR = "' + logDir + '";',
+    'const cgWrite = async (kind, payload) => {',
+    '  const line = "[dsh-crash-guard] " + new Date().toISOString() + " [" + kind + "] " + String(payload ?? "") + "\\n";',
+    '  try { console.error(line.trimEnd()); } catch (_) {}',
+    '  try {',
+    '    const m = await import("node:fs");',
+    '    m.mkdirSync(CG_LOG_DIR, { recursive: true });',
+    '    m.appendFileSync(CG_LOG_DIR + "/crash-guard.log", line, "utf8");',
+    '  } catch (_) {}',
+    '};',
+    'process.on("uncaughtException", (err) => { cgWrite("uncaughtException", err?.stack || err); });',
+    'process.on("unhandledRejection", (reason) => { cgWrite("unhandledRejection", reason); });',
+    'process.on("error", (err) => { cgWrite("process-error", err?.stack || err); });',
+  ];
+  if (withBoot) lines.push('cgWrite("boot", "dsh 进程启动 pid=" + process.pid);');
+  lines.push('// ===== end crash-guard-v2.1 =====');
+  return lines.join("\n");
+}
 
-// worker index.js 内联块（类方法内, 无法定义模块级 helper）
-const WORKER_INDEX_V2 = "\t\tworker.on(\"error\", (err) => {\n" +
-  "\t\t\t// [dsh-crash-guard:v2:worker-error] 拦截 worker 崩溃, 防止传播到主进程\n" +
-  "\t\t\tconst line = \"[dsh-crash-guard] \" + new Date().toISOString() + \" [worker-error] \" + String(err?.stack || err) + \"\\n\";\n" +
-  "\t\t\tconsole.error(line.trimEnd());\n" +
-  "\t\t\ttry { const m = require(\"node:fs\"); const dir = (process.env.USERPROFILE || process.env.HOME || process.cwd() || \"\").replace(/\\\\/g, \"/\") + \"/.dsh/logs\"; m.mkdirSync(dir, { recursive: true }); m.appendFileSync(dir + \"/crash-guard.log\", line, \"utf8\"); } catch (_) {}\n" +
-  "\t\t});\n" +
-  "\t\tworker.on(\"exit\", (code) => {\n" +
-  "\t\t\t// [dsh-crash-guard:v2:worker-exit] 异常退出才打印(Windows 正常 terminate 恒为 1):\n" +
-  "\t\t\tconst line = \"[dsh-crash-guard] \" + new Date().toISOString() + \" [worker-exit] code=\" + code + \"\\n\";\n" +
-  "\t\t\tif (code !== 1) console.error(line.trimEnd());\n" +
-  "\t\t\ttry { const m = require(\"node:fs\"); const dir = (process.env.USERPROFILE || process.env.HOME || process.cwd() || \"\").replace(/\\\\/g, \"/\") + \"/.dsh/logs\"; m.mkdirSync(dir, { recursive: true }); m.appendFileSync(dir + \"/crash-guard.log\", line, \"utf8\"); } catch (_) {}\n" +
-  "\t\t});\n";
+function makeGuardCjs(logDir) {
+  const lines = [
+    '// ===== [' + MARK + '] worker 崩溃防护（文件日志版）=====',
+    'const CG_LOG_DIR = "' + logDir + '";',
+    'const cgWrite = (kind, payload) => {',
+    '  const line = "[dsh-crash-guard] " + new Date().toISOString() + " [" + kind + "] " + String(payload ?? "") + "\\n";',
+    '  if (kind !== "boot") { try { console.error(line.trimEnd()); } catch (_) {} }',
+    '  try {',
+    '    const m = require("node:fs");',
+    '    m.mkdirSync(CG_LOG_DIR, { recursive: true });',
+    '    m.appendFileSync(CG_LOG_DIR + "/crash-guard.log", line, "utf8");',
+    '  } catch (_) {}',
+    '};',
+    'process.on("uncaughtException", (err) => { cgWrite("worker-uncaughtException", err?.stack || err); });',
+    'process.on("unhandledRejection", (reason) => { cgWrite("worker-unhandledRejection", reason); });',
+    'cgWrite("boot", "worker 线程加载 pid=" + process.pid);',
+    '// ===== end crash-guard-v2.1 =====',
+  ];
+  return lines.join("\n");
+}
 
-// ---------- 旧版清理 ----------
+function makeWorkerIndexBlock(logDir) {
+  const fsWrite = '(async () => { try { const m = await import("node:fs"); m.mkdirSync("' + logDir + '", { recursive: true }); m.appendFileSync("' + logDir + '/crash-guard.log", line, "utf8"); } catch (_) {} })();';
+  return [
+    '\t\tworker.on("error", (err) => {',
+    '\t\t\t// [dsh-crash-guard:v2.1:worker-error] 拦截 worker 崩溃, 防止传播到主进程(ESM: 用 import() 异步写)',
+    '\t\t\tconst line = "[dsh-crash-guard] " + new Date().toISOString() + " [worker-error] " + String(err?.stack || err) + "\\n";',
+    '\t\t\tconsole.error(line.trimEnd());',
+    '\t\t\t' + fsWrite,
+    '\t\t});',
+    '\t\tworker.on("exit", (code) => {',
+    '\t\t\t// [dsh-crash-guard:v2.1:worker-exit] 异常退出才打印(Windows 正常 terminate 恒为 1):',
+    '\t\t\tconst line = "[dsh-crash-guard] " + new Date().toISOString() + " [worker-exit] code=" + code + "\\n";',
+    '\t\t\tif (code !== 1) console.error(line.trimEnd());',
+    '\t\t\t' + fsWrite,
+    '\t\t});',
+  ].join("\n") + "\n";
+}
 
-function stripOldGuardEsm(content) {
-  const re = /\/\/ ={5} \[dsh-crash-guard\][\s\S]*?\/\/ ={5} end crash-guard[^\n]*\n?/m;
+// ---------- 旧版清理(任意 v1/v2/v2.0 块均可剥离) ----------
+
+function stripAnyGuardBlock(content) {
+  const re = /\/\/ ={5} \[dsh-crash-guard[^\]]*\][\s\S]*?\/\/ ={5} end crash-guard[^\n]*\n?/m;
   if (re.test(content)) return content.replace(re, "");
   return content;
 }
 
-function stripOldWorkerIndex(content) {
-  const re = /worker\.on\("error", \(err\) => \{\s*\n[\s\S]*?dsh-crash-guard:worker-exit[\s\S]*?\}\);[\s]*\n/m;
+function stripWorkerIndexBlocks(content) {
+  const re = /worker\.on\("error", \(err\) => \{\s*\n[\s\S]*?dsh-crash-guard[^\n]*worker-exit[\s\S]*?\}\);[\s]*\n/m;
   if (re.test(content)) return content.replace(re, "");
   return content;
 }
@@ -142,10 +156,10 @@ function injectAfterFirstRequire(content, guard) {
 function applyEsm(file, guard) {
   if (!fs.existsSync(file)) return { skipped: true, reason: "文件不存在" };
   let content = fs.readFileSync(file, "utf8");
-  if (content.includes(V2_MARKER)) return { skipped: true, reason: "已是 v2" };
-  const isOld = /\[dsh-crash-guard\]/.test(content);
+  if (content.includes("end crash-guard-v2.1")) return { skipped: true, reason: "已是 v2.1" };
+  const isOld = /\[dsh-crash-guard/.test(content);
   if (isOld) {
-    content = stripOldGuardEsm(content);
+    content = stripAnyGuardBlock(content);
   } else if (!fs.existsSync(file + ".bak-crashguard")) {
     fs.copyFileSync(file, file + ".bak-crashguard");
   }
@@ -161,11 +175,10 @@ function applyEsm(file, guard) {
 function applyWorkerCjs(file, guard) {
   if (!fs.existsSync(file)) return { skipped: true, reason: "文件不存在" };
   let content = fs.readFileSync(file, "utf8");
-  if (content.includes(V2_MARKER)) return { skipped: true, reason: "已是 v2" };
-  const isOld = /\[dsh-crash-guard:worker\]/.test(content);
+  if (content.includes("end crash-guard-v2.1")) return { skipped: true, reason: "已是 v2.1" };
+  const isOld = /\[dsh-crash-guard/.test(content);
   if (isOld) {
-    const re = /\/\/ ={5} \[dsh-crash-guard\] worker[\s\S]*?\/\/ ={5} end crash-guard[^\n]*\n?/m;
-    content = content.replace(re, "");
+    content = stripAnyGuardBlock(content);
   } else if (!fs.existsSync(file + ".bak-crashguard")) {
     fs.copyFileSync(file, file + ".bak-crashguard");
   }
@@ -175,21 +188,21 @@ function applyWorkerCjs(file, guard) {
   return { patched: true, upgraded: isOld };
 }
 
-function applyWorkerIndex(file) {
+function applyWorkerIndex(file, block) {
   if (!fs.existsSync(file)) return { skipped: true, reason: "文件不存在" };
   let content = fs.readFileSync(file, "utf8");
-  if (content.includes("dsh-crash-guard:v2:worker-error")) return { skipped: true, reason: "已是 v2" };
-  const isOld = content.includes("dsh-crash-guard:worker-error") || content.includes("dsh-crash-guard:worker-exit");
+  if (content.includes("dsh-crash-guard:v2.1:worker-error")) return { skipped: true, reason: "已是 v2.1" };
+  const isOld = /dsh-crash-guard/.test(content);
   if (isOld) {
-    content = stripOldWorkerIndex(content);
+    content = stripWorkerIndexBlocks(content);
   } else if (!fs.existsSync(file + ".bak-crashguard")) {
     fs.copyFileSync(file, file + ".bak-crashguard");
   }
-  // 锚点必须消歧: waitForPipeDrain 里也有 "return new Promise((resolve) => {",
-  // 但只有 worker 运行回调后面紧跟 "let settled = false;", 用该组合定位, 否则插错位置导致 ReferenceError。
+  // 锚点: worker 运行回调(其后紧跟 let settled = false), 全文必须唯一
   const anchorRe = /return new Promise\(\(resolve\) => \{\s*\n[ \t]*let settled = false;/;
-  if (!anchorRe.test(content)) return { skipped: true, reason: "未找到插入点(锚点: let settled)" };
-  content = content.replace(anchorRe, (m) => WORKER_INDEX_V2 + m);
+  const hits = (content.match(anchorRe) || []).length;
+  if (hits !== 1) return { skipped: true, reason: "锚点命中 " + hits + " 处(应为 1), 中止" };
+  content = content.replace(anchorRe, (m) => block + m);
   fs.writeFileSync(file, content);
   return { patched: true, upgraded: isOld };
 }
@@ -225,11 +238,14 @@ async function main() {
     return;
   }
 
+  const logDir = resolveLogDir();
+  log("日志目录(固化):", logDir);
+
   const targets = [
-    ["bin.js", applyEsm(binJs, GUARD_ESM)],
-    ["app-boot/index.js", applyEsm(appBoot, GUARD_ESM)],
-    ["worker.cjs", applyWorkerCjs(workerCjs, GUARD_CJS)],
-    ["worker index.js", applyWorkerIndex(workerIndex)],
+    ["bin.js", applyEsm(binJs, makeGuardEsm(logDir, true))],
+    ["app-boot/index.js", applyEsm(appBoot, makeGuardEsm(logDir, false))],
+    ["worker.cjs", applyWorkerCjs(workerCjs, makeGuardCjs(logDir))],
+    ["worker index.js", applyWorkerIndex(workerIndex, makeWorkerIndexBlock(logDir))],
   ];
 
   for (const [name, r] of targets) {
@@ -251,15 +267,24 @@ async function main() {
     }
   }
 
-  // 守护启动器
+  // 守护启动器(带 UAC 提权; 缺失或旧版则重写)
   const repoDir = path.dirname(fs.realpathSync(__filename));
   const guardCmd = path.join(repoDir, "start-guard.cmd");
-  if (!fs.existsSync(guardCmd)) {
+  let cmd = "";
+  if (fs.existsSync(guardCmd)) cmd = fs.readFileSync(guardCmd, "utf8");
+  if (!cmd.includes("net session")) {
     fs.writeFileSync(guardCmd, [
       "@echo off",
       "chcp 65001 >nul",
+      "rem 一键管理员终端式守护: 双击后自动请求 UAC 并以管理员运行 DSH, 崩溃后 3 秒自动重启",
+      "net session >nul 2>&1",
+      "if %errorlevel% neq 0 (",
+      "    echo 正在请求管理员权限...",
+      "    powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"",
+      "    exit /b",
+      ")",
       "title dsh web 守护启动器 (崩溃自动重启, Ctrl+C 退出)",
-      "echo [dsh-crash-guard] 守护模式: dsh web 崩溃后 3 秒自动重启...",
+      "echo [dsh-crash-guard] 守护模式: dsh web 崩溃后 3 秒自动重启... (Ctrl+C 停止)",
       ":loop",
       "set HTTP_PROXY=http://127.0.0.1:7891",
       "set HTTPS_PROXY=http://127.0.0.1:7891",
@@ -270,10 +295,10 @@ async function main() {
       "goto loop",
       "",
     ].join("\r\n"), "utf8");
-    log("已生成守护启动器:", guardCmd);
+    log("已生成/更新守护启动器:", guardCmd);
   }
 
-  log("完成。请重启 DSH 使 v2 防护生效。");
+  log("完成。请重启 DSH 使 v2.1 完全生效(worker.cjs 对新 worker 即时生效)。");
 }
 
 main().catch(e => { console.error(TAG, "失败:", e.message); process.exit(1); });
