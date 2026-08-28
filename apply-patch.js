@@ -121,7 +121,9 @@ async function main() {
         '  console.error("[dsh-crash-guard:worker-error]", err?.stack || err);',
         '});',
         'worker.on("exit", (code) => {',
-        '  console.error("[dsh-crash-guard:worker-exit] code=" + code);',
+        '  // 正常完成路径固定走 worker.terminate()，Windows 上 exit code 恒为 1（日志噪音），不打印。',
+        '  // 真正的异常退出 code != 1（OOM 134 / 自然退出 0 / 崩溃 3）。',
+        '  if (code !== 1) console.error("[dsh-crash-guard:worker-exit] unexpected code=" + code);',
         '});',
         anchor,
       ].join("\n");
