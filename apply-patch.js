@@ -185,9 +185,11 @@ function applyWorkerIndex(file) {
   } else if (!fs.existsSync(file + ".bak-crashguard")) {
     fs.copyFileSync(file, file + ".bak-crashguard");
   }
-  const anchor = "return new Promise((resolve) => {";
-  if (!content.includes(anchor)) return { skipped: true, reason: "未找到插入点" };
-  content = content.replace(anchor, WORKER_INDEX_V2 + anchor);
+  // 锚点必须消歧: waitForPipeDrain 里也有 "return new Promise((resolve) => {",
+  // 但只有 worker 运行回调后面紧跟 "let settled = false;", 用该组合定位, 否则插错位置导致 ReferenceError。
+  const anchorRe = /return new Promise\(\(resolve\) => \{\s*\n[ \t]*let settled = false;/;
+  if (!anchorRe.test(content)) return { skipped: true, reason: "未找到插入点(锚点: let settled)" };
+  content = content.replace(anchorRe, (m) => WORKER_INDEX_V2 + m);
   fs.writeFileSync(file, content);
   return { patched: true, upgraded: isOld };
 }
