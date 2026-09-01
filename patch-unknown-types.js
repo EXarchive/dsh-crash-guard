@@ -1,4 +1,3 @@
-
 #!/usr/bin/env node
 /**
  * patch-unknown-types.js — dsh-crash-guard 配套: 修复 SessionFormatUnsupportedError
