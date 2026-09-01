@@ -43,6 +43,15 @@ function findDshRoot() {
 }
 
 // 固化日志目录: 打补丁时解析(此时是正常 shell, 环境变量齐全)
+// 子包路径解析: 支持嵌套(node_modules/@deepseek-ai/X)与 npx/平铺(root/../../@deepseek-ai/X)两种布局
+function resolvePkg(root, name) {
+  const nested = path.join(root, "node_modules", "@deepseek-ai", name);
+  if (fs.existsSync(path.join(nested, "package.json"))) return nested;
+  const flat = path.join(root, "..", "..", "@deepseek-ai", name);
+  if (fs.existsSync(path.join(flat, "package.json"))) return flat;
+  return nested;
+}
+
 function resolveLogDir() {
   const home = process.env.USERPROFILE || process.env.HOME || "";
   if (home) return home.replace(/\\/g, "/") + "/.dsh/logs";
@@ -219,9 +228,9 @@ async function main() {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   log("版本:", pkg.version);
 
-  const appBoot = path.join(root, "node_modules", "@deepseek-ai", "dsh-app-boot", "lib", "index.js");
-  const workerCjs = path.join(root, "node_modules", "@deepseek-ai", "dsh-code-runtime-worker-thread", "lib", "worker.cjs");
-  const workerIndex = path.join(root, "node_modules", "@deepseek-ai", "dsh-code-runtime-worker-thread", "lib", "index.js");
+  const appBoot = path.join(resolvePkg(root, "dsh-app-boot"), "lib", "index.js");
+  const workerCjs = path.join(resolvePkg(root, "dsh-code-runtime-worker-thread"), "lib", "worker.cjs");
+  const workerIndex = path.join(resolvePkg(root, "dsh-code-runtime-worker-thread"), "lib", "index.js");
   const binJs = path.join(root, "lib", "bin.js");
 
   if (restore) {
